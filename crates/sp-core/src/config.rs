@@ -30,6 +30,9 @@ pub struct PortConfig {
     pub pack_timeout_ms: i64,
     pub hex_view: bool,
     pub hex_send: bool,
+    /// ANSI 转义渲染（仅文本模式生效）
+    #[serde(default)]
+    pub ansi_view: bool,
     /// 接收区最大保留条数（环形淘汰）
     pub max_records: usize,
 }
@@ -45,6 +48,7 @@ impl Default for PortConfig {
             pack_timeout_ms: 50,
             hex_view: false,
             hex_send: false,
+            ansi_view: false,
             max_records: 2000,
         }
     }
@@ -83,6 +87,27 @@ pub struct Settings {
     /// 定时发送间隔（毫秒），0 = 未启用
     #[serde(default)]
     pub timer_interval_ms: u64,
+    /// Lua 双向钩子脚本
+    #[serde(default)]
+    pub lua_script: String,
+    /// Lua 钩子是否启用
+    #[serde(default)]
+    pub lua_enabled: bool,
+    /// 上次使用的通道类型："serial" | "tcp-client" | "tcp-server" | "udp"
+    #[serde(default)]
+    pub channel_kind: String,
+    /// TCP 客户端目标地址
+    #[serde(default)]
+    pub tcp_client_addr: String,
+    /// TCP 服务端监听地址
+    #[serde(default)]
+    pub tcp_listen_addr: String,
+    /// UDP 本地绑定地址
+    #[serde(default)]
+    pub udp_bind_addr: String,
+    /// UDP 远端目标地址
+    #[serde(default)]
+    pub udp_remote_addr: String,
 }
 
 impl Settings {
@@ -96,6 +121,24 @@ impl Settings {
         while self.quick_page_names.len() < self.quick_pages.len() {
             let n = self.quick_page_names.len() + 1;
             self.quick_page_names.push(format!("第{n}页"));
+        }
+        if self.lua_script.is_empty() {
+            self.lua_script = crate::hooks::DEFAULT_SCRIPT.to_string();
+        }
+        if self.channel_kind.is_empty() {
+            self.channel_kind = "serial".into();
+        }
+        if self.tcp_listen_addr.is_empty() {
+            self.tcp_listen_addr = "0.0.0.0:9000".into();
+        }
+        if self.udp_bind_addr.is_empty() {
+            self.udp_bind_addr = "0.0.0.0:9001".into();
+        }
+        if self.udp_remote_addr.is_empty() {
+            self.udp_remote_addr = "127.0.0.1:9000".into();
+        }
+        if self.tcp_client_addr.is_empty() {
+            self.tcp_client_addr = "127.0.0.1:9000".into();
         }
     }
 

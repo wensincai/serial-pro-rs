@@ -3,3 +3,6 @@
 logs/
 settings.json
 settings.json.bakup
+
+# hook crate 独立 target（nightly 构建）
+crates/serial_monitor_hook/target/

@@ -44,6 +44,11 @@ impl ActiveSerial {
         self.event_rx.try_recv().ok()
     }
 
+    /// 事件接收端克隆句柄（供测试/日志旁路使用）。
+    pub fn event_handle(&self) -> mpmc::Receiver<ChannelEvent> {
+        self.event_rx.clone()
+    }
+
     pub fn send_bytes(&self, bytes: Vec<u8>) {
         let _ = self.cmd_tx.send(ChannelCommand::Send(bytes));
     }
@@ -96,6 +101,33 @@ impl SerialHub {
         let id = self.next_id;
         self.next_id += 1;
         let active = crate::serial::spawn_serial(id, cfg.clone())?;
+        self.active.insert(id, active);
+        Ok(id)
+    }
+
+    /// 打开 TCP 客户端通道。
+    pub fn open_tcp_client(&mut self, addr: &str) -> Result<SerialId, crate::Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let active = crate::net::spawn_tcp_client(id, addr)?;
+        self.active.insert(id, active);
+        Ok(id)
+    }
+
+    /// 打开 TCP 服务端通道（监听，支持多客户端）。
+    pub fn open_tcp_server(&mut self, listen_addr: &str) -> Result<SerialId, crate::Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let active = crate::net::spawn_tcp_server(id, listen_addr)?;
+        self.active.insert(id, active);
+        Ok(id)
+    }
+
+    /// 打开 UDP 通道。
+    pub fn open_udp(&mut self, bind_addr: &str, remote_addr: &str) -> Result<SerialId, crate::Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let active = crate::net::spawn_udp(id, bind_addr, remote_addr)?;
         self.active.insert(id, active);
         Ok(id)
     }

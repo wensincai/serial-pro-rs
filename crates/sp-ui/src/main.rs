@@ -7,18 +7,20 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use sp_core::channel::{ChannelEvent, SerialHub, SerialId};
 use sp_core::config::{Parity, PortConfig, QuickSendItem, Settings};
 use sp_core::frame::{CrcAlgo, CrcRange};
-use sp_core::logging::{LogWriter};
+use sp_core::hooks::LuaHooks;
+use sp_core::logging::LogWriter;
+use sp_core::plot::PlotData;
 use sp_core::queue::{QueueCursor, QueueItem};
 use sp_core::hexutil;
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
+fn main() -> eframe::Result<()> {    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("serial-pro")
             .with_inner_size([1180.0, 780.0]),
@@ -78,6 +80,48 @@ struct RxRecord {
     bytes: Vec<u8>,
 }
 
+// ---------------------------------------------------------------- 串口监听
+
+/// Udata（与 serial_monitor_hook 的 packed 结构一致）：
+/// com_port u8 @0, comm_state u8 @1, file_handle i32 @4, data_size i32 @8, data @12
+const MON_STATE_DISCONNECT: u8 = 2;
+const MON_STATE_RECEIVE: u8 = 3;
+const MON_STATE_SEND: u8 = 4;
+
+#[derive(Debug, Clone)]
+struct MonitorMsg {
+    com: u8,
+    state: u8,
+    data: Vec<u8>,
+}
+
+/// DLL 回调把数据投递到这里；Mutex<Option<_>> 支持重新开始监听时换通道。
+static MONITOR_TX: Mutex<Option<crossbeam_channel::Sender<MonitorMsg>>> = Mutex::new(None);
+
+/// C 回调：解析 packed Udata 并转发。
+/// # Safety
+/// 由 serial_monitor.dll 的 worker 线程调用，p 必须指向合法 Udata。
+unsafe extern "system" fn monitor_cb(p: *const std::ffi::c_void) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    let base = p as *const u8;
+    let read_u8 = |off: usize| std::ptr::read_unaligned(base.add(off));
+    let read_i32 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const i32);
+    let com = read_u8(0);
+    let state = read_u8(1);
+    let size = read_i32(8);
+    if size <= 0 || size as usize > 8192 {
+        return 0;
+    }
+    let data =
+        std::slice::from_raw_parts(base.add(12), size as usize).to_vec();
+    if let Some(tx) = MONITOR_TX.lock().ok().and_then(|g| g.clone()) {
+        let _ = tx.send(MonitorMsg { com, state, data });
+    }
+    0
+}
+
 struct App {
     settings: Settings,
     settings_path: PathBuf,
@@ -132,12 +176,31 @@ struct App {
     // 日志
     log_writers: HashMap<SerialId, LogWriter>,
     export_fmt: ExportFmt,
+
+    // Lua 双向钩子
+    lua: LuaHooks,
+    lua_win_open: bool,
+    lua_script_edit: String,
+    lua_prints: Vec<String>,
+
+    // 示波器
+    plot: PlotData,
+    plot_win_open: bool,
+
+    // 串口监听（API Hook 注入，来自 llcom serial_monitor_rs）
+    monitor_win_open: bool,
+    monitor_procs: Vec<(String, u32)>,
+    monitor_proc_sel: usize,
+    monitor_com: u32,
+    monitor_listening: bool,
+    monitor_rx: Option<crossbeam_channel::Receiver<MonitorMsg>>,
 }
 
 impl App {
     fn new() -> Self {
         let settings_path = Settings::default_path();
         let settings = Settings::load(&settings_path);
+        let lua_script = settings.lua_script.clone();
         let mut app = Self {
             settings,
             settings_path,
@@ -174,6 +237,18 @@ impl App {
             timer_last: Instant::now(),
             log_writers: HashMap::new(),
             export_fmt: ExportFmt::Text,
+            lua: LuaHooks::new().unwrap_or_else(|_| panic!("Lua 引擎初始化失败")),
+            lua_win_open: false,
+            lua_script_edit: lua_script,
+            lua_prints: Vec::new(),
+            plot: PlotData::default(),
+            plot_win_open: false,
+            monitor_win_open: false,
+            monitor_procs: Vec::new(),
+            monitor_proc_sel: 0,
+            monitor_com: 3,
+            monitor_listening: false,
+            monitor_rx: None,
         };
         app.refresh_ports();
         if let Some((name, _)) = app.ports.first().cloned() {
@@ -225,16 +300,28 @@ impl App {
         }
     }
 
-    /// 把字节发到所有已打开的通道。
+    /// 把字节发到所有已打开的通道（先过 Lua 发送钩子）。
     fn send_bytes_to_all(&mut self, bytes: &[u8]) {
-        let ids = self.hub.ids();
-        if ids.is_empty() {
-            self.last_error = Some("没有已打开的串口".into());
+        if self.hub.ids().is_empty() {
+            self.last_error = Some("没有已打开的通道".into());
             return;
         }
+        let bytes = if self.settings.lua_enabled {
+            let (out, err) = self.lua.transform_send(bytes);
+            if let Some(e) = err {
+                self.last_error = Some(format!("Lua on_send: {e}"));
+            }
+            out
+        } else {
+            bytes.to_vec()
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        let ids = self.hub.ids();
         for id in &ids {
             if let Some(a) = self.hub.get(*id) {
-                a.send_bytes(bytes.to_vec());
+                a.send_bytes(bytes.clone());
             }
         }
     }
@@ -347,22 +434,144 @@ impl App {
         self.hub.close(id);
         self.log_writers.remove(&id);
     }
+
+    // ---------------------------------------- 串口监听
+    fn refresh_procs(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Diagnostics::ToolHelp::*;
+            let mut list: Vec<(String, u32)> = Vec::new();
+            unsafe {
+                let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                    self.last_error = Some("进程快照创建失败".into());
+                    return;
+                };
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                if Process32FirstW(snap, &mut entry).is_ok() {
+                    loop {
+                        let name = String::from_utf16_lossy(
+                            &entry
+                                .szExeFile
+                                .iter()
+                                .take_while(|&&c| c != 0)
+                                .copied()
+                                .collect::<Vec<u16>>(),
+                        );
+                        // 过滤明显的系统进程（PID 0/4 与无窗口服务进程难以精确判断，交用户选择）
+                        if entry.th32ProcessID > 4 {
+                            list.push((name, entry.th32ProcessID));
+                        }
+                        if Process32NextW(snap, &mut entry).is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(snap);
+            }
+            list.sort_by_key(|(n, _)| n.to_lowercase());
+            self.monitor_procs = list;
+            self.monitor_proc_sel = 0;
+        }
+    }
+
+    fn start_monitor(&mut self) {
+        if self.monitor_listening {
+            return;
+        }
+        let Some((name, pid)) = self.monitor_procs.get(self.monitor_proc_sel).cloned() else {
+            self.last_error = Some("请先选择目标进程".into());
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::unbounded::<MonitorMsg>();
+        *MONITOR_TX.lock().unwrap() = Some(tx);
+        let ok = unsafe { serial_monitor::MonitorComm(pid, self.monitor_com, monitor_cb) };
+        if ok == 1 {
+            self.monitor_rx = Some(rx);
+            self.monitor_listening = true;
+            self.last_error = Some(format!("已开始监听 {name} (pid {pid})，COM{}", self.monitor_com));
+        } else {
+            *MONITOR_TX.lock().unwrap() = None;
+            self.last_error =
+                Some("MonitorComm 失败：可能需要管理员权限、目标进程受保护或已退出".into());
+        }
+    }
+
+    fn stop_monitor(&mut self) {
+        if self.monitor_listening {
+            unsafe { serial_monitor::UnMonitorComm() };
+            self.monitor_listening = false;
+        }
+        self.monitor_rx = None;
+        *MONITOR_TX.lock().unwrap() = None;
+    }
+
+    fn poll_monitor(&mut self) {
+        let Some(rx) = self.monitor_rx.clone() else { return };
+        while let Ok(msg) = rx.try_recv() {
+            match msg.state {
+                MON_STATE_RECEIVE | MON_STATE_SEND => {
+                    let dir_tx = msg.state == MON_STATE_SEND;
+                    self.push_record(dir_tx, msg.data);
+                }
+                MON_STATE_DISCONNECT => {
+                    self.last_error =
+                        Some(format!("监听目标断开了 COM{}", msg.com));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---------------------------------------- Lua 钩子
+    fn apply_lua_script(&mut self) {
+        let script = self.lua_script_edit.clone();
+        match self.lua.load_script(&script) {
+            Ok(()) => {
+                self.settings.lua_script = script;
+                self.last_error = Some("Lua 脚本已加载".into());
+                self.save_settings();
+            }
+            Err(e) => self.last_error = Some(format!("{e}")),
+        }
+        self.lua_prints.extend(self.lua.take_prints());
+    }
+
+    /// 每帧收集脚本输出（print/sp.log）。
+    fn sync_lua_prints(&mut self) {
+        let new = self.lua.take_prints();
+        if !new.is_empty() {
+            self.lua_prints.extend(new);
+            let max = 200;
+            while self.lua_prints.len() > max {
+                self.lua_prints.remove(0);
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels();
+        self.poll_monitor();
         self.tick_queue();
         self.tick_timer();
+        self.sync_lua_prints();
         self.top_panel(ctx);
         self.right_panel(ctx);
         self.central_panel(ctx);
         self.bottom_panel(ctx);
         self.status_bar(ctx);
+        self.lua_window(ctx);
+        self.plot_window(ctx);
+        self.monitor_window(ctx);
         ctx.request_repaint_after(Duration::from_millis(30));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_monitor();
         if let Some(name) = self.selected_port_name() {
             self.cfg.name = name.clone();
             self.settings.ports.insert(name, self.cfg.clone());
@@ -384,7 +593,23 @@ impl App {
                 match ev {
                     ChannelEvent::Opened(_) => {}
                     ChannelEvent::Rx(ch, bytes) => {
+                        // Lua 接收钩子（替换显示/记录内容）
+                        let bytes = if self.settings.lua_enabled {
+                            let (out, err) = self.lua.transform_recv(&bytes);
+                            if let Some(e) = err {
+                                self.last_error = Some(format!("Lua on_recv: {e}"));
+                            }
+                            out
+                        } else {
+                            bytes
+                        };
                         self.log_write(ch, false, &bytes);
+                        if self.cfg.hex_view {
+                            // 示波器 Hex 模式按字节取值
+                            self.plot.feed(&bytes, true);
+                        } else {
+                            self.plot.feed(&bytes, false);
+                        }
                         self.push_record(false, bytes);
                     }
                     ChannelEvent::TxEcho(ch, bytes) => {
@@ -449,86 +674,195 @@ impl App {
     fn top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                // 通道类型
+                const SERIAL: &str = "serial";
+                const TCP_C: &str = "tcp-client";
+                const TCP_S: &str = "tcp-server";
+                const UDP: &str = "udp";
+                let kind_label = |k: &str| match k {
+                    TCP_C => "TCP客户端",
+                    TCP_S => "TCP服务端",
+                    UDP => "UDP",
+                    _ => "串口",
+                };
+                egui::ComboBox::from_id_salt("chan_kind")
+                    .width(100.0)
+                    .selected_text(kind_label(&self.settings.channel_kind))
+                    .show_ui(ui, |ui| {
+                        for (k, label) in [
+                            (SERIAL, "串口"),
+                            (TCP_C, "TCP客户端"),
+                            (TCP_S, "TCP服务端"),
+                            (UDP, "UDP"),
+                        ] {
+                            ui.selectable_value(
+                                &mut self.settings.channel_kind,
+                                k.to_string(),
+                                label,
+                            );
+                        }
+                    });
                 if ui.button("刷新端口").clicked() {
                     self.refresh_ports();
                 }
-                egui::ComboBox::from_id_salt("port_sel")
-                    .width(220.0)
-                    .selected_text(self.port_label(self.selected_port))
-                    .show_ui(ui, |ui| {
-                        for i in 0..self.ports.len() {
-                            let label = self.port_label(i);
-                            ui.selectable_value(&mut self.selected_port, i, label);
+                let serial_kind = self.settings.channel_kind == SERIAL;
+                if serial_kind {
+                    egui::ComboBox::from_id_salt("port_sel")
+                        .width(220.0)
+                        .selected_text(self.port_label(self.selected_port))
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.ports.len() {
+                                let label = self.port_label(i);
+                                ui.selectable_value(&mut self.selected_port, i, label);
+                            }
+                        });
+
+                    let bauds = [1200u32, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
+                    egui::ComboBox::from_id_salt("baud_sel")
+                        .width(90.0)
+                        .selected_text(format!("{}", self.cfg.baud))
+                        .show_ui(ui, |ui| {
+                            for b in bauds {
+                                ui.selectable_value(&mut self.cfg.baud, b, format!("{b}"));
+                            }
+                        });
+                    ui.add(egui::DragValue::new(&mut self.cfg.baud).speed(100));
+
+                    egui::ComboBox::from_id_salt("db_sel")
+                        .width(60.0)
+                        .selected_text(format!("{}位", self.cfg.data_bits))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.data_bits, 7, "7位");
+                            ui.selectable_value(&mut self.cfg.data_bits, 8, "8位");
+                        });
+                    let mut parity = self.cfg.parity;
+                    egui::ComboBox::from_id_salt("parity_sel")
+                        .width(60.0)
+                        .selected_text(match parity {
+                            Parity::None => "无校验",
+                            Parity::Odd => "奇校验",
+                            Parity::Even => "偶校验",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut parity, Parity::None, "无校验");
+                            ui.selectable_value(&mut parity, Parity::Odd, "奇校验");
+                            ui.selectable_value(&mut parity, Parity::Even, "偶校验");
+                        });
+                    self.cfg.parity = parity;
+
+                    egui::ComboBox::from_id_salt("stop_sel")
+                        .width(60.0)
+                        .selected_text(format!("{}停止", self.cfg.stop_bits))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.stop_bits, 1, "1停止");
+                            ui.selectable_value(&mut self.cfg.stop_bits, 2, "2停止");
+                        });
+
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.pack_timeout_ms)
+                            .speed(1)
+                            .prefix("分包:"),
+                    )
+                    .on_hover_text("毫秒；<0 = 流模式（不分包）");
+                } else {
+                    // 网络通道参数
+                    match self.settings.channel_kind.as_str() {
+                        TCP_C => {
+                            ui.label("目标");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.tcp_client_addr)
+                                    .desired_width(180.0)
+                                    .hint_text("127.0.0.1:9000"),
+                            );
                         }
-                    });
-
-                let bauds = [1200u32, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
-                egui::ComboBox::from_id_salt("baud_sel")
-                    .width(90.0)
-                    .selected_text(format!("{}", self.cfg.baud))
-                    .show_ui(ui, |ui| {
-                        for b in bauds {
-                            ui.selectable_value(&mut self.cfg.baud, b, format!("{b}"));
+                        TCP_S => {
+                            ui.label("监听");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.tcp_listen_addr)
+                                    .desired_width(180.0)
+                                    .hint_text("0.0.0.0:9000"),
+                            );
                         }
-                    });
-                ui.add(egui::DragValue::new(&mut self.cfg.baud).speed(100));
+                        UDP => {
+                            ui.label("本地");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.udp_bind_addr)
+                                    .desired_width(140.0)
+                                    .hint_text("0.0.0.0:9001"),
+                            );
+                            ui.label("目标");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.udp_remote_addr)
+                                    .desired_width(140.0)
+                                    .hint_text("127.0.0.1:9000"),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
 
-                egui::ComboBox::from_id_salt("db_sel")
-                    .width(60.0)
-                    .selected_text(format!("{}位", self.cfg.data_bits))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.cfg.data_bits, 7, "7位");
-                        ui.selectable_value(&mut self.cfg.data_bits, 8, "8位");
-                    });
-                let mut parity = self.cfg.parity;
-                egui::ComboBox::from_id_salt("parity_sel")
-                    .width(60.0)
-                    .selected_text(match parity {
-                        Parity::None => "无校验",
-                        Parity::Odd => "奇校验",
-                        Parity::Even => "偶校验",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut parity, Parity::None, "无校验");
-                        ui.selectable_value(&mut parity, Parity::Odd, "奇校验");
-                        ui.selectable_value(&mut parity, Parity::Even, "偶校验");
-                    });
-                self.cfg.parity = parity;
-
-                egui::ComboBox::from_id_salt("stop_sel")
-                    .width(60.0)
-                    .selected_text(format!("{}停止", self.cfg.stop_bits))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.cfg.stop_bits, 1, "1停止");
-                        ui.selectable_value(&mut self.cfg.stop_bits, 2, "2停止");
-                    });
-
-                ui.add(
-                    egui::DragValue::new(&mut self.cfg.pack_timeout_ms)
-                        .speed(1)
-                        .prefix("分包:"),
-                )
-                .on_hover_text("毫秒；<0 = 流模式（不分包）");
-
-                let port_open = self
-                    .selected_port_name()
-                    .map(|n| self.port_channel.iter().any(|(_, p)| *p == n));
-                match port_open {
-                    Some(true) => {
-                        if ui.button("关闭串口").clicked() {
-                            if let Some(id) = self.open_id_of_port() {
+                // 打开/关闭按钮（区分通道类型）
+                let chan_label = match self.settings.channel_kind.as_str() {
+                    TCP_C => ("打开连接", "关闭连接"),
+                    TCP_S => ("开始监听", "停止监听"),
+                    UDP => ("打开 UDP", "关闭 UDP"),
+                    _ => ("打开串口", "关闭串口"),
+                };
+                if serial_kind {
+                    let port_open = self
+                        .selected_port_name()
+                        .map(|n| self.port_channel.iter().any(|(_, p)| *p == n));
+                    match port_open {
+                        Some(true) => {
+                            if ui.button(chan_label.1).clicked() {
+                                if let Some(id) = self.open_id_of_port() {
+                                    self.close_port(id);
+                                }
+                            }
+                            ui.colored_label(egui::Color32::from_rgb(60, 160, 60), "● 已打开");
+                        }
+                        _ => {
+                            if ui.button(chan_label.0).clicked() {
+                                self.open_selected_port();
+                            }
+                            ui.weak("○ 未打开");
+                        }
+                    }
+                } else {
+                    let kind = self.settings.channel_kind.clone();
+                    let label = match kind.as_str() {
+                        TCP_C => self.settings.tcp_client_addr.clone(),
+                        TCP_S => self.settings.tcp_listen_addr.clone(),
+                        _ => format!(
+                            "{}→{}",
+                            self.settings.udp_bind_addr, self.settings.udp_remote_addr
+                        ),
+                    };
+                    let open = self.port_channel.iter().any(|(_, p)| *p == label);
+                    if open {
+                        if ui.button(chan_label.1).clicked() {
+                            if let Some(id) = self
+                                .port_channel
+                                .iter()
+                                .find(|(_, p)| *p == label)
+                                .map(|(id, _)| *id)
+                            {
                                 self.close_port(id);
                             }
                         }
-                        ui.colored_label(egui::Color32::from_rgb(60, 160, 60), "● 已打开");
-                    }
-                    _ => {
-                        if ui.button("打开串口").clicked() {
-                            self.open_selected_port();
-                        }
+                        ui.colored_label(egui::Color32::from_rgb(60, 160, 60), "● 已连接");
+                    } else if ui.button(chan_label.0).clicked() {
+                        self.open_net_channel(&kind, &label);
+                    } else {
                         ui.weak("○ 未打开");
                     }
                 }
+
+                ui.separator();
+                // 扩展工具
+                ui.toggle_value(&mut self.lua_win_open, "Lua 钩子");
+                ui.toggle_value(&mut self.plot_win_open, "示波器");
+                ui.toggle_value(&mut self.monitor_win_open, "监听");
 
                 ui.separator();
                 let mut log_on = self.settings.log.enabled;
@@ -542,6 +876,28 @@ impl App {
                 }
             });
         });
+    }
+
+    /// 打开网络通道（kind: "tcp-client" | "tcp-server" | "udp"）。
+    fn open_net_channel(&mut self, kind: &str, label: &str) {
+        let r = match kind {
+            "tcp-client" => self.hub.open_tcp_client(&self.settings.tcp_client_addr.clone()),
+            "tcp-server" => self.hub.open_tcp_server(&self.settings.tcp_listen_addr.clone()),
+            "udp" => self.hub.open_udp(
+                &self.settings.udp_bind_addr.clone(),
+                &self.settings.udp_remote_addr.clone(),
+            ),
+            _ => {
+                return;
+            }
+        };
+        match r {
+            Ok(id) => {
+                self.port_channel.push((id, label.to_string()));
+                self.save_settings();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
     }
 
     fn port_label(&self, i: usize) -> String {
@@ -895,6 +1251,8 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.cfg.hex_view, "Hex 显示");
+                ui.checkbox(&mut self.cfg.ansi_view, "ANSI 渲染")
+                    .on_hover_text("文本模式下解析 ANSI 颜色（Hex 显示时自动失效）");
                 ui.checkbox(&mut self.scroll_paused, "暂停滚屏");
                 if ui.button("清屏").clicked() {
                     self.records.clear();
@@ -935,15 +1293,40 @@ impl App {
                             egui::Color32::from_rgb(60, 140, 60)
                         };
                         let arrow = if rec.dir_tx { "→" } else { "←" };
-                        let body = if hex_view {
-                            hexutil::to_hex(&rec.bytes, " ")
+                        if hex_view {
+                            let body = hexutil::to_hex(&rec.bytes, " ");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(format!("{ts} {arrow}"));
+                                ui.monospace(egui::RichText::new(body).color(color).monospace());
+                            });
+                        } else if self.cfg.ansi_view {
+                            // ANSI 着色渲染
+                            let segs = sp_core::ansi::parse_ansi(&rec.bytes);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(format!("{ts} {arrow}"));
+                                ui.monospace(egui::RichText::new("").color(color));
+                                for seg in &segs {
+                                    let mut text =
+                                        egui::RichText::new(seg.text.as_str()).monospace();
+                                    if let Some([r, g, b]) = seg.fg {
+                                        text = text.color(egui::Color32::from_rgb(r, g, b));
+                                    }
+                                    if seg.bold {
+                                        text = text.strong();
+                                    }
+                                    if seg.underline {
+                                        text = text.underline();
+                                    }
+                                    ui.monospace(text);
+                                }
+                            });
                         } else {
-                            hexutil::readable(&rec.bytes)
-                        };
-                        ui.horizontal_wrapped(|ui| {
-                            ui.monospace(format!("{ts} {arrow}"));
-                            ui.monospace(egui::RichText::new(body).color(color).monospace());
-                        });
+                            let body = hexutil::readable(&rec.bytes);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(format!("{ts} {arrow}"));
+                                ui.monospace(egui::RichText::new(body).color(color).monospace());
+                            });
+                        }
                     }
                 });
         });
@@ -1122,6 +1505,179 @@ impl App {
                     }
                 });
             });
+    }
+
+    // ---------------------------------------- Lua 钩子窗口
+    fn lua_window(&mut self, ctx: &egui::Context) {
+        if !self.lua_win_open {
+            return;
+        }
+        let mut open = self.lua_win_open;
+        egui::Window::new("Lua 双向钩子")
+            .id(egui::Id::new("lua_win"))
+            .default_width(620.0)
+            .default_height(480.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let mut enabled = self.settings.lua_enabled;
+                    if ui
+                        .checkbox(&mut enabled, "启用钩子")
+                        .on_hover_text("启用后 on_send/on_recv 将替换收发数据")
+                        .changed()
+                    {
+                        self.settings.lua_enabled = enabled;
+                        self.save_settings();
+                    }
+                    ui.weak(if self.lua.loaded() { "已加载" } else { "未加载" });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("应用脚本").clicked() {
+                            self.apply_lua_script();
+                        }
+                        if ui.button("恢复示例").clicked() {
+                            self.lua_script_edit =
+                                sp_core::hooks::DEFAULT_SCRIPT.to_string();
+                        }
+                    });
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("lua_script")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.lua_script_edit)
+                                .code_editor()
+                                .desired_rows(16)
+                                .desired_width(580.0),
+                        );
+                    });
+                ui.separator();
+                ui.weak("data 为原始字节串；返回新字符串即替换数据，返回 nil 透传。");
+                ui.weak("工具：sp.hex(s) sp.fromhex(\"AA 55\") sp.log(msg) print(...)");
+
+                // 脚本输出
+                ui.separator();
+                ui.strong("脚本输出");
+                egui::ScrollArea::vertical()
+                    .id_salt("lua_prints")
+                    .max_height(120.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.lua_prints {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+        self.lua_win_open = open;
+    }
+
+    // ---------------------------------------- 示波器窗口
+    fn plot_window(&mut self, ctx: &egui::Context) {
+        if !self.plot_win_open {
+            return;
+        }
+        let mut open = self.plot_win_open;
+        egui::Window::new("示波器")
+            .id(egui::Id::new("plot_win"))
+            .default_width(640.0)
+            .default_height(360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak("从接收数据提取数值：文本按列（第1/2/3个数字），Hex 按字节");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("清空").clicked() {
+                            self.plot.clear();
+                        }
+                    });
+                });
+                let colors = [
+                    egui::Color32::from_rgb(80, 160, 240),
+                    egui::Color32::from_rgb(80, 220, 120),
+                    egui::Color32::from_rgb(240, 120, 80),
+                ];
+                let names = ["第1列", "第2列", "第3列"];
+                egui_plot::Plot::new("scope")
+                    .height(260.0)
+                    .legend(egui_plot::Legend::default())
+                    .show(ui, |ui| {
+                        for (k, series) in self.plot.series.iter().enumerate() {
+                            if series.points.is_empty() {
+                                continue;
+                            }
+                            let pts: Vec<[f64; 2]> = series
+                                .points
+                                .iter()
+                                .map(|&(x, y)| [x, y])
+                                .collect();
+                            let line = egui_plot::Line::new(names[k], pts)
+                                .color(colors[k])
+                                .stroke(egui::Stroke::new(1.2_f32, colors[k]));
+                            ui.add(line);
+                        }
+                    });
+            });
+        self.plot_win_open = open;
+    }
+
+    // ---------------------------------------- 串口监听窗口
+    fn monitor_window(&mut self, ctx: &egui::Context) {
+        if !self.monitor_win_open {
+            return;
+        }
+        let mut open = self.monitor_win_open;
+        egui::Window::new("串口监听（API Hook 注入）")
+            .id(egui::Id::new("monitor_win"))
+            .default_width(560.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.weak("监视其它进程对指定 COM 口的收发（ReadFile/WriteFile 注入 Hook）。");
+                ui.weak("注意：需要管理员权限运行本程序；仅支持注入 64 位进程；数据会显示在主接收区。");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui.button("刷新进程").clicked() {
+                        self.refresh_procs();
+                    }
+                    let label = self
+                        .monitor_procs
+                        .get(self.monitor_proc_sel)
+                        .map(|(n, p)| format!("{n} ({p})"))
+                        .unwrap_or_else(|| "(请刷新进程)".into());
+                    egui::ComboBox::from_id_salt("mon_proc")
+                        .width(280.0)
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            for (i, (n, p)) in self.monitor_procs.clone().iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.monitor_proc_sel,
+                                    i,
+                                    format!("{n} ({p})"),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("COM 口号");
+                    ui.add(
+                        egui::DragValue::new(&mut self.monitor_com)
+                            .range(0..=255)
+                            .prefix("COM"),
+                    );
+                    if self.monitor_listening {
+                        if ui.button("■ 停止监听").clicked() {
+                            self.stop_monitor();
+                        }
+                        ui.colored_label(egui::Color32::from_rgb(60, 160, 60), "● 监听中");
+                    } else if ui.button("▶ 开始监听").clicked() {
+                        self.start_monitor();
+                    } else {
+                        ui.weak("○ 未监听");
+                    }
+                });
+            });
+        self.monitor_win_open = open;
     }
 }
 
