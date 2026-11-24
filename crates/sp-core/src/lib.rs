@@ -6,9 +6,14 @@
 pub mod channel;
 pub mod config;
 pub mod error;
+pub mod frame;
 pub mod hexutil;
+pub mod logging;
+pub mod queue;
 pub mod serial;
 
 pub use channel::{ChannelCommand, ChannelEvent, SerialHub, SerialId};
 pub use config::{Parity, PortConfig, QuickSendItem, Settings};
 pub use error::{Error, Result};
+pub use frame::{CrcAlgo, CrcRange, FrameSpec};
+pub use queue::{CommandQueue, QueueCursor, QueueItem};

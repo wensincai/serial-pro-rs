@@ -63,12 +63,45 @@ pub struct Settings {
     /// 每端口参数记忆：端口名 -> 上次使用的配置
     #[serde(default)]
     pub ports: HashMap<String, PortConfig>,
-    /// 快捷发送条目（单页；P1 扩展多页）
+    /// 快捷发送多页（P1：最多 10 页）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quick_send: Vec<QuickSendItem>, // 旧字段：仅作迁移源，序列化时跳过
     #[serde(default)]
-    pub quick_send: Vec<QuickSendItem>,
+    pub quick_pages: Vec<Vec<QuickSendItem>>,
+    /// 快捷发送页名（与 quick_pages 等长）
+    #[serde(default)]
+    pub quick_page_names: Vec<String>,
+    /// 自动日志配置
+    #[serde(default)]
+    pub log: crate::logging::LogConfig,
+    /// 帧结构发送配置
+    #[serde(default)]
+    pub frame: crate::frame::FrameSpec,
+    /// 命令队列
+    #[serde(default)]
+    pub queue: crate::queue::CommandQueue,
+    /// 定时发送间隔（毫秒），0 = 未启用
+    #[serde(default)]
+    pub timer_interval_ms: u64,
 }
 
 impl Settings {
+    /// 旧版单列表迁移到第 1 页；pages 为空时补一页空的。
+    pub fn migrate(&mut self) {
+        if self.quick_pages.is_empty() {
+            let first = std::mem::take(&mut self.quick_send);
+            self.quick_pages = vec![first];
+        }
+        self.quick_send.clear();
+        while self.quick_page_names.len() < self.quick_pages.len() {
+            let n = self.quick_page_names.len() + 1;
+            self.quick_page_names.push(format!("第{n}页"));
+        }
+    }
+
+    pub fn pages(&self) -> &[Vec<QuickSendItem>] {
+        &self.quick_pages
+    }
     pub fn port_config(&self, port: &str) -> PortConfig {
         self.ports.get(port).cloned().unwrap_or_else(|| PortConfig {
             name: port.to_string(),
@@ -94,12 +127,15 @@ impl Settings {
     pub fn load(path: &Path) -> Settings {
         for p in [path.to_path_buf(), path.with_extension("json.bakup")] {
             if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Ok(s) = serde_json::from_str(&text) {
+                if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
+                    s.migrate();
                     return s;
                 }
             }
         }
-        Settings::default()
+        let mut s = Settings::default();
+        s.migrate();
+        s
     }
 
     /// 保存；先把旧文件滚动为 .bakup 再原子写临时文件。
@@ -136,19 +172,62 @@ mod tests {
             ..Default::default()
         };
         s.ports.insert("COM3".into(), cfg);
-        s.quick_send.push(QuickSendItem {
+        s.quick_pages.push(vec![QuickSendItem {
             label: "复位".into(),
             content: "AT+RST\\r\\n".into(),
             hex: false,
-        });
+        }]);
         s.save(&path).unwrap();
 
         let loaded = Settings::load(&path);
         assert_eq!(loaded.ports["COM3"].baud, 9600);
         assert_eq!(loaded.ports["COM3"].parity, Parity::Even);
         assert_eq!(loaded.ports["COM3"].pack_timeout_ms, -1);
-        assert_eq!(loaded.quick_send.len(), 1);
-        assert_eq!(loaded.quick_send[0].label, "复位");
+        assert_eq!(loaded.quick_pages.len(), 1);
+        assert_eq!(loaded.quick_pages[0][0].label, "复位");
+    }
+
+    #[test]
+    fn migrate_legacy_quick_send() {
+        // 旧版 JSON：只有 quick_send 单列表
+        let legacy = r#"{
+            "ports": {},
+            "quick_send": [{"label": "旧条目", "content": "AA 55", "hex": true}]
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, legacy).unwrap();
+        let s = Settings::load(&path);
+        assert_eq!(s.quick_pages.len(), 1);
+        assert_eq!(s.quick_pages[0][0].label, "旧条目");
+        // 再保存后应使用 quick_pages 且跳过 quick_send 字段
+        s.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("quick_pages"));
+        assert!(!text.contains("quick_send"));
+    }
+
+    #[test]
+    fn frame_and_queue_in_settings_roundtrip() {
+        let mut s = Settings::default();
+        s.frame.header = "AA55".into();
+        s.frame.crc = crate::frame::CrcAlgo::Crc16Modbus;
+        s.queue.items.push(crate::queue::QueueItem {
+            label: "启动".into(),
+            content: "01".into(),
+            hex: true,
+            delay_ms: 500,
+        });
+        s.timer_interval_ms = 1000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        s.save(&path).unwrap();
+        let back = Settings::load(&path);
+        assert_eq!(back.frame.header, "AA55");
+        assert_eq!(back.frame.crc, crate::frame::CrcAlgo::Crc16Modbus);
+        assert_eq!(back.queue.items.len(), 1);
+        assert_eq!(back.queue.items[0].delay_ms, 500);
+        assert_eq!(back.timer_interval_ms, 1000);
     }
 
     #[test]
