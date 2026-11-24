@@ -1,0 +1,16 @@
+[package]
+name = "sp-core"
+description = "serial-pro engine: serial worker, channel protocol, config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serialport = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = "3"

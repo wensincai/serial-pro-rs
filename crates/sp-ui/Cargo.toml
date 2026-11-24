@@ -1,0 +1,16 @@
+[package]
+name = "sp-ui"
+description = "serial-pro GUI (egui): serial debugging console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "serial-pro"
+path = "src/main.rs"
+
+[dependencies]
+sp-core = { path = "../sp-core" }
+eframe = "0.33"
+egui = "0.33"
+serialport = "4"
