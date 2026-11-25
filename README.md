@@ -34,11 +34,24 @@
 - **ANSI 终端渲染**：SGR 颜色（16 色/256 色/真彩）、粗体/斜体/下划线；
   光标/清屏序列剥离；适合 ESP32/STM32 等 boot log 调试
 
+### P4 扩展通道与分发
+- **MQTT 通道**（rumqttc）：Broker/订阅主题/发布主题可配，订阅→接收区、发送→发布
+- **WinUSB 通道**（rusb，libusb vendored 静态链入）：按 `VID:PID` 打开 bulk IN/OUT
+  设备（Windows 侧需先用 Zadig 把设备驱动切到 WinUSB/libusb）
+- **中/英界面切换**：工具栏 EN/中 按钮，设置持久化
+- **NSIS 安装包**：双语向导，产物 `installer\serial-pro-setup.exe`
+
 ## 构建
 
 ```bat
 cargo build --release        :: 产物 target\release\serial-pro.exe
-cargo test                   :: 全部单元测试
+cargo test                   :: 全部单元测试（61 个）
+
+:: 串口监听 Hook DLL（nightly，独立 workspace，产物由 build.rs 内嵌）
+cargo +nightly build --release --manifest-path crates\serial_monitor_hook\Cargo.toml
+
+:: NSIS 安装包
+makensis installer\serial-pro.nsi
 ```
 
 ## 路线图
@@ -49,16 +62,18 @@ cargo test                   :: 全部单元测试
 | P1 | 日志模板+分片、快捷发送多页、帧结构发送、命令队列、定时发送 ✅ |
 | P2 | Lua 双向钩子、TCP/UDP 通道、示波器 ✅ |
 | P3 | 串口监听（API Hook 注入）、ANSI 终端 ✅ |
-| P4 | NSIS 安装包、多语言、MQTT 通道、WinUSB |
+| P4 | NSIS 安装包、多语言、MQTT 通道、WinUSB ✅ |
 
 ## 工程结构
 
 ```
-crates/sp-core              引擎：串口/网络通道、Lua 钩子、示波器供数、ANSI、日志 —— 无 UI 依赖，可测试
-crates/sp-ui                egui 界面
+crates/sp-core              引擎：六类通道 worker（串口/TCP/UDP/MQTT/WinUSB）、Lua 钩子、
+                            示波器供数、ANSI、日志、帧/队列 —— 无 UI 依赖，可测试
+crates/sp-ui                egui 界面（多语言 lang.rs、示波器、Lua 窗口、监听窗口）
 crates/serial_monitor       串口监听注入器（llcom serial_monitor_rs，Apache-2.0）
-crates/serial_monitor_hook  注入用 Hook DLL（hook ReadFile/WriteFile）
-docs/                       需求分析 / 架构设计 / 开发计划
+crates/serial_monitor_hook  注入用 Hook DLL（nightly 构建，独立 workspace）
+installer/                  NSIS 安装包脚本与产物
+docs/                       需求分析（含 FR 实现状态标注）/ 架构设计 / 开发计划
 ```
 
 ## License
