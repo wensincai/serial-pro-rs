@@ -12,6 +12,8 @@ pub enum Error {
     InvalidHex(String),
     #[error("Lua 钩子错误: {0}")]
     Hook(String),
+    #[error("无效参数: {0}")]
+    InvalidParam(String),
 }
 
 impl From<mlua::Error> for Error {

@@ -108,6 +108,24 @@ pub struct Settings {
     /// UDP 远端目标地址
     #[serde(default)]
     pub udp_remote_addr: String,
+    /// MQTT broker 地址（host:port）
+    #[serde(default)]
+    pub mqtt_broker: String,
+    /// MQTT 客户端 id（空则自动生成）
+    #[serde(default)]
+    pub mqtt_client_id: String,
+    /// MQTT 订阅主题（收）
+    #[serde(default)]
+    pub mqtt_sub_topic: String,
+    /// MQTT 发布主题（发）
+    #[serde(default)]
+    pub mqtt_pub_topic: String,
+    /// WinUSB 设备 VID:PID（十六进制，如 1A86:7523）
+    #[serde(default)]
+    pub usb_vid_pid: String,
+    /// 界面语言："zh" | "en"
+    #[serde(default)]
+    pub lang: String,
 }
 
 impl Settings {
@@ -139,6 +157,21 @@ impl Settings {
         }
         if self.tcp_client_addr.is_empty() {
             self.tcp_client_addr = "127.0.0.1:9000".into();
+        }
+        if self.mqtt_broker.is_empty() {
+            self.mqtt_broker = "broker.emqx.io:1883".into();
+        }
+        if self.mqtt_sub_topic.is_empty() {
+            self.mqtt_sub_topic = "serial-pro/rx".into();
+        }
+        if self.mqtt_pub_topic.is_empty() {
+            self.mqtt_pub_topic = "serial-pro/tx".into();
+        }
+        if self.usb_vid_pid.is_empty() {
+            self.usb_vid_pid = "1A86:7523".into();
+        }
+        if self.lang.is_empty() {
+            self.lang = "zh".into();
         }
     }
 

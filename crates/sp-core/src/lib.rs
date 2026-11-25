@@ -11,10 +11,12 @@ pub mod frame;
 pub mod hexutil;
 pub mod hooks;
 pub mod logging;
+pub mod mqtt;
 pub mod net;
 pub mod plot;
 pub mod queue;
 pub mod serial;
+pub mod usb;
 
 pub use ansi::AnsiSeg;
 pub use channel::{ChannelCommand, ChannelEvent, SerialHub, SerialId};

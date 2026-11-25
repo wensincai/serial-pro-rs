@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+mod lang;
+
 use eframe::egui;
 use sp_core::channel::{ChannelEvent, SerialHub, SerialId};
 use sp_core::config::{Parity, PortConfig, QuickSendItem, Settings};
@@ -19,6 +21,8 @@ use sp_core::logging::LogWriter;
 use sp_core::plot::PlotData;
 use sp_core::queue::{QueueCursor, QueueItem};
 use sp_core::hexutil;
+use sp_core::mqtt::MqttParams;
+use lang::{tr, Lang};
 
 fn main() -> eframe::Result<()> {    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -176,6 +180,8 @@ struct App {
     // 日志
     log_writers: HashMap<SerialId, LogWriter>,
     export_fmt: ExportFmt,
+    /// 界面语言
+    lang: Lang,
 
     // Lua 双向钩子
     lua: LuaHooks,
@@ -201,6 +207,7 @@ impl App {
         let settings_path = Settings::default_path();
         let settings = Settings::load(&settings_path);
         let lua_script = settings.lua_script.clone();
+        let lang = Lang::from_code(&settings.lang);
         let mut app = Self {
             settings,
             settings_path,
@@ -237,6 +244,7 @@ impl App {
             timer_last: Instant::now(),
             log_writers: HashMap::new(),
             export_fmt: ExportFmt::Text,
+            lang,
             lua: LuaHooks::new().unwrap_or_else(|_| panic!("Lua 引擎初始化失败")),
             lua_win_open: false,
             lua_script_edit: lua_script,
@@ -679,21 +687,27 @@ impl App {
                 const TCP_C: &str = "tcp-client";
                 const TCP_S: &str = "tcp-server";
                 const UDP: &str = "udp";
+                const MQTT: &str = "mqtt";
+                const USB: &str = "winusb";
                 let kind_label = |k: &str| match k {
-                    TCP_C => "TCP客户端",
-                    TCP_S => "TCP服务端",
-                    UDP => "UDP",
-                    _ => "串口",
+                    TCP_C => tr(self.lang, "TCP客户端"),
+                    TCP_S => tr(self.lang, "TCP服务端"),
+                    UDP => tr(self.lang, "UDP"),
+                    MQTT => tr(self.lang, "MQTT"),
+                    USB => tr(self.lang, "WinUSB"),
+                    _ => tr(self.lang, "串口"),
                 };
                 egui::ComboBox::from_id_salt("chan_kind")
                     .width(100.0)
                     .selected_text(kind_label(&self.settings.channel_kind))
                     .show_ui(ui, |ui| {
                         for (k, label) in [
-                            (SERIAL, "串口"),
-                            (TCP_C, "TCP客户端"),
-                            (TCP_S, "TCP服务端"),
-                            (UDP, "UDP"),
+                            (SERIAL, tr(self.lang, "串口")),
+                            (TCP_C, tr(self.lang, "TCP客户端")),
+                            (TCP_S, tr(self.lang, "TCP服务端")),
+                            (UDP, tr(self.lang, "UDP")),
+                            (MQTT, tr(self.lang, "MQTT")),
+                            (USB, tr(self.lang, "WinUSB")),
                         ] {
                             ui.selectable_value(
                                 &mut self.settings.channel_kind,
@@ -702,7 +716,16 @@ impl App {
                             );
                         }
                     });
-                if ui.button("刷新端口").clicked() {
+                let lang_btn = match self.lang {
+                    Lang::Zh => "EN",
+                    Lang::En => "中",
+                };
+                if ui.button(lang_btn).clicked() {
+                    self.lang = self.lang.other();
+                    self.settings.lang = self.lang.code().to_string();
+                    self.save_settings();
+                }
+                if ui.button(tr(self.lang, "刷新端口")).clicked() {
                     self.refresh_ports();
                 }
                 let serial_kind = self.settings.channel_kind == SERIAL;
@@ -730,7 +753,7 @@ impl App {
 
                     egui::ComboBox::from_id_salt("db_sel")
                         .width(60.0)
-                        .selected_text(format!("{}位", self.cfg.data_bits))
+                        .selected_text(format!("{}bit", self.cfg.data_bits))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.cfg.data_bits, 7, "7位");
                             ui.selectable_value(&mut self.cfg.data_bits, 8, "8位");
@@ -752,7 +775,7 @@ impl App {
 
                     egui::ComboBox::from_id_salt("stop_sel")
                         .width(60.0)
-                        .selected_text(format!("{}停止", self.cfg.stop_bits))
+                        .selected_text(format!("{}-stop", self.cfg.stop_bits))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.cfg.stop_bits, 1, "1停止");
                             ui.selectable_value(&mut self.cfg.stop_bits, 2, "2停止");
@@ -761,7 +784,7 @@ impl App {
                     ui.add(
                         egui::DragValue::new(&mut self.cfg.pack_timeout_ms)
                             .speed(1)
-                            .prefix("分包:"),
+                            .prefix(tr(self.lang, "分包:")),
                     )
                     .on_hover_text("毫秒；<0 = 流模式（不分包）");
                 } else {
@@ -784,17 +807,43 @@ impl App {
                             );
                         }
                         UDP => {
-                            ui.label("本地");
+                            ui.label(tr(self.lang, "本地"));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.settings.udp_bind_addr)
                                     .desired_width(140.0)
                                     .hint_text("0.0.0.0:9001"),
                             );
-                            ui.label("目标");
+                            ui.label(tr(self.lang, "目标"));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.settings.udp_remote_addr)
                                     .desired_width(140.0)
                                     .hint_text("127.0.0.1:9000"),
+                            );
+                        }
+                        MQTT => {
+                            ui.label("Broker");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.mqtt_broker)
+                                    .desired_width(160.0)
+                                    .hint_text("broker.emqx.io:1883"),
+                            );
+                            ui.label(tr(self.lang, "订阅主题"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.mqtt_sub_topic)
+                                    .desired_width(110.0),
+                            );
+                            ui.label(tr(self.lang, "发布主题"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.mqtt_pub_topic)
+                                    .desired_width(110.0),
+                            );
+                        }
+                        USB => {
+                            ui.label("VID:PID");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.usb_vid_pid)
+                                    .desired_width(120.0)
+                                    .hint_text("1A86:7523"),
                             );
                         }
                         _ => {}
@@ -803,10 +852,12 @@ impl App {
 
                 // 打开/关闭按钮（区分通道类型）
                 let chan_label = match self.settings.channel_kind.as_str() {
-                    TCP_C => ("打开连接", "关闭连接"),
-                    TCP_S => ("开始监听", "停止监听"),
-                    UDP => ("打开 UDP", "关闭 UDP"),
-                    _ => ("打开串口", "关闭串口"),
+                    TCP_C => (tr(self.lang, "打开连接"), tr(self.lang, "关闭连接")),
+                    TCP_S => (tr(self.lang, "开始监听"), tr(self.lang, "停止监听")),
+                    UDP => (tr(self.lang, "打开 UDP"), tr(self.lang, "关闭 UDP")),
+                    MQTT => (tr(self.lang, "打开 MQTT"), tr(self.lang, "关闭 MQTT")),
+                    USB => (tr(self.lang, "打开 USB"), tr(self.lang, "关闭 USB")),
+                    _ => (tr(self.lang, "打开串口"), tr(self.lang, "关闭串口")),
                 };
                 if serial_kind {
                     let port_open = self
@@ -833,6 +884,11 @@ impl App {
                     let label = match kind.as_str() {
                         TCP_C => self.settings.tcp_client_addr.clone(),
                         TCP_S => self.settings.tcp_listen_addr.clone(),
+                        MQTT => format!(
+                            "{} ⇄ {}",
+                            self.settings.mqtt_sub_topic, self.settings.mqtt_pub_topic
+                        ),
+                        USB => format!("usb:{}", self.settings.usb_vid_pid),
                         _ => format!(
                             "{}→{}",
                             self.settings.udp_bind_addr, self.settings.udp_remote_addr
@@ -866,13 +922,13 @@ impl App {
 
                 ui.separator();
                 let mut log_on = self.settings.log.enabled;
-                if ui.checkbox(&mut log_on, "自动日志").changed() {
+                if ui.checkbox(&mut log_on, tr(self.lang, "自动日志")).changed() {
                     self.settings.log.enabled = log_on;
                     self.sync_log_writers();
                     self.save_settings();
                 }
                 if log_on {
-                    ui.weak(format!("{} MB/片", self.settings.log.frag_mb));
+                    ui.weak(format!("{} {}", self.settings.log.frag_mb, tr(self.lang, "MB/片")));
                 }
             });
         });
@@ -887,6 +943,16 @@ impl App {
                 &self.settings.udp_bind_addr.clone(),
                 &self.settings.udp_remote_addr.clone(),
             ),
+            "mqtt" => self.hub.open_mqtt(&MqttParams {
+                broker: self.settings.mqtt_broker.clone(),
+                client_id: self.settings.mqtt_client_id.clone(),
+                sub_topic: self.settings.mqtt_sub_topic.clone(),
+                pub_topic: self.settings.mqtt_pub_topic.clone(),
+            }),
+            "winusb" => match sp_core::usb::parse_vid_pid(&self.settings.usb_vid_pid.clone()) {
+                Ok((vid, pid)) => self.hub.open_winusb(vid, pid),
+                Err(e) => Err(e),
+            },
             _ => {
                 return;
             }
@@ -1250,10 +1316,10 @@ impl App {
     fn central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.cfg.hex_view, "Hex 显示");
+                ui.checkbox(&mut self.cfg.hex_view, tr(self.lang, "Hex 显示"));
                 ui.checkbox(&mut self.cfg.ansi_view, "ANSI 渲染")
                     .on_hover_text("文本模式下解析 ANSI 颜色（Hex 显示时自动失效）");
-                ui.checkbox(&mut self.scroll_paused, "暂停滚屏");
+                ui.checkbox(&mut self.scroll_paused, tr(self.lang, "暂停滚屏"));
                 if ui.button("清屏").clicked() {
                     self.records.clear();
                 }
@@ -1450,7 +1516,7 @@ impl App {
                     )
                     .lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("发送").clicked() || send_clicked {
+                if ui.button(tr(self.lang, "发送")).clicked() || send_clicked {
                     self.send_current();
                 }
                 if ui.button("清空").clicked() {
@@ -1513,7 +1579,7 @@ impl App {
             return;
         }
         let mut open = self.lua_win_open;
-        egui::Window::new("Lua 双向钩子")
+        egui::Window::new(tr(self.lang, "Lua 双向钩子"))
             .id(egui::Id::new("lua_win"))
             .default_width(620.0)
             .default_height(480.0)
@@ -1578,7 +1644,7 @@ impl App {
             return;
         }
         let mut open = self.plot_win_open;
-        egui::Window::new("示波器")
+        egui::Window::new(tr(self.lang, "示波器"))
             .id(egui::Id::new("plot_win"))
             .default_width(640.0)
             .default_height(360.0)
@@ -1627,7 +1693,7 @@ impl App {
             return;
         }
         let mut open = self.monitor_win_open;
-        egui::Window::new("串口监听（API Hook 注入）")
+        egui::Window::new(tr(self.lang, "串口监听（API Hook 注入）"))
             .id(egui::Id::new("monitor_win"))
             .default_width(560.0)
             .open(&mut open)

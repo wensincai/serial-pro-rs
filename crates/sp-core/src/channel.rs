@@ -132,6 +132,24 @@ impl SerialHub {
         Ok(id)
     }
 
+    /// 打开 MQTT 通道。
+    pub fn open_mqtt(&mut self, params: &crate::mqtt::MqttParams) -> Result<SerialId, crate::Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let active = crate::mqtt::spawn_mqtt(id, params.clone())?;
+        self.active.insert(id, active);
+        Ok(id)
+    }
+
+    /// 打开 WinUSB 通道。
+    pub fn open_winusb(&mut self, vid: u16, pid: u16) -> Result<SerialId, crate::Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let active = crate::usb::spawn_winusb(id, vid, pid)?;
+        self.active.insert(id, active);
+        Ok(id)
+    }
+
     pub fn close(&mut self, id: SerialId) {
         if let Some(a) = self.active.get_mut(&id) {
             a.close();
